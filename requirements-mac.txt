@@ -1,0 +1,17 @@
+# EshanAI runtime dependencies for the macOS build (GitHub Actions).
+# Windows builds use pip-installed env directly; this file pins the same
+# cross-platform set so the cloud Mac installs exactly what the app needs.
+requests>=2.32
+customtkinter>=5.2
+pillow>=10.4
+numpy
+sounddevice
+piper-tts==1.8.0
+pathvalidate
+faster-whisper
+psutil
+pyautogui
+# darwin-only: TTS fallback engine + pyautogui/Quartz need pyobjc
+pyttsx3; sys_platform == "darwin"
+pyobjc-core; sys_platform == "darwin"
+pyobjc; sys_platform == "darwin"

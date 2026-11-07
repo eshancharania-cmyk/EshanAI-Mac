@@ -1,0 +1,15 @@
+# EshanAI — everything here is build output or local sandbox data;
+# the repo should contain only source + assets.
+EshanAI/build/
+EshanAI/dist/
+EshanAI/dev_data/
+EshanAI/preview_data/
+
+# local development notes + probes (not part of the product)
+probes/
+PLAN.md
+
+# python noise
+__pycache__/
+*.pyc
+*.pyo
