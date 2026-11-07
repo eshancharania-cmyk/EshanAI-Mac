@@ -9,7 +9,8 @@ on:
 
 jobs:
   mac:
-    runs-on: macos-13        # Intel builder → runs on Apple Silicon via Rosetta
+    runs-on: macos-15-intel    # Intel x64 (macos-13 label retired → queued forever);
+                               # runs on Apple Silicon via Rosetta too
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
