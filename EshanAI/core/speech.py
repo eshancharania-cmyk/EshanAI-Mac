@@ -424,43 +424,126 @@ class Speaker:
         cache[key] = obj
         return obj
 
+    def _log(self, msg: str):
+        """One-line TTS telemetry (never throws)."""
+        try:
+            import datetime
+            with open(paths.logs_dir() / "tts.log", "a",
+                      encoding="utf-8", errors="replace") as f:
+                f.write(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] "
+                        f"{msg}\n")
+        except Exception:
+            pass
+
     def _piper_speak(self, text: str) -> bool:
-        """Neural voice: sentence-sized chunks straight into the sound
-        stream (barge-in cuts within ~150 ms). True = handled, False =
-        caller should fall back to the Windows desktop voice."""
+        """Neural voice, callback playback — can never block this thread
+        no matter what the audio device does:
+
+          1. synthesize the WHOLE text up front (fast: ~5x realtime);
+          2. play through a callback stream that never writes back;
+          3. a watchdog notices a stalled device, restarts the stream
+             once, and finally falls back to the Windows voice so
+             speech NEVER silently vanishes.
+        True = piper handled it, False = caller should use the fallback.
+        """
         try:
             voice = self._piper_voice()
             if voice is None:
+                self._log("piper: voice object unavailable")
                 return False
+            import numpy as np
             import sounddevice as sd
             from piper import SynthesisConfig
-            with self._lock:
-                self._cur_engine = "piper"
-            sr = voice.config.sample_rate
+            sr = int(voice.config.sample_rate)
             rate = int(config.get("voice.rate", 178)) or 178
             length = max(0.78, min(1.45, 192.0 / rate))
             cfg = SynthesisConfig(volume=0.95, length_scale=length)
-            stream = sd.OutputStream(samplerate=sr, channels=1,
-                                     dtype="int16")
-            stream.start()
-            try:
-                for ch in voice.synthesize(text, cfg):
-                    pcm = ch.audio_int16_array
-                    step = max(1, int(sr * 0.15))
-                    for i in range(0, len(pcm), step):
-                        if self._stopped.is_set():
-                            return True
-                        stream.write(pcm[i:i + step])
-                while stream.active and not self._stopped.is_set():
-                    time.sleep(0.03)
-            finally:
+            t0 = time.perf_counter()
+            audio = [np.asarray(ch.audio_int16_array, dtype=np.int16)
+                     for ch in voice.synthesize(text, cfg)]
+            first_ms = (time.perf_counter() - t0) * 1000.0
+            if not audio or sum(len(a) for a in audio) == 0:
+                self._log("piper: nothing synthesized")
+                return False
+            pcm = (audio[0] if len(audio) == 1
+                   else np.concatenate(audio))
+
+            state = {"pos": 0, "last": time.time(), "fin": None}
+
+            def _cb(out, frames, _t, _st):
                 try:
-                    stream.abort()
-                    stream.close()
+                    b = out[:, 0] if out.ndim == 2 else out
+                    n = b.shape[0]
+                    pos = state["pos"]
+                    take = min(n, len(pcm) - pos)
+                    if self._stopped.is_set():
+                        b.fill(0)
+                        return
+                    if take > 0:
+                        b[:take] = pcm[pos:pos + take]
+                        state["pos"] = pos + take
+                        state["last"] = time.time()
+                    if take < n:
+                        b[take:].fill(0)
                 except Exception:
                     pass
-            return True
+
+            for attempt in (0, 1):
+                state["last"] = time.time()
+                stream = sd.OutputStream(
+                    samplerate=sr, channels=1, dtype="int16",
+                    callback=_cb, blocksize=max(256, sr // 8))
+                stream.start()
+                self._emit({"type": "_tts_state", "speaking": True})
+                try:
+                    while stream.active and not self._stopped.is_set():
+                        if state["pos"] >= len(pcm):
+                            # all audio delivered — let the device tail drain
+                            if state["fin"] is None:
+                                state["fin"] = time.time()
+                            elif time.time() - state["fin"] > 0.35:
+                                self._log(
+                                    f"piper ok: {len(pcm)} samples "
+                                    f"(first_sound={first_ms:.0f} ms)")
+                                return True          # finished cleanly
+                            time.sleep(0.04)
+                            continue
+                        time.sleep(0.05)
+                        if time.time() - state["last"] > 3.0:
+                            if attempt == 0:
+                                self._log(
+                                    "piper: device stall at "
+                                    f"{state['pos']}/{len(pcm)} "
+                                    f"(first_sound={first_ms:.0f} ms) "
+                                    "→ restarting stream")
+                                break              # restart once
+                            self._log(
+                                "piper: device stall again → "
+                                "giving up to SAPI fallback")
+                            return False
+                    if self._stopped.is_set():
+                        return True
+                    if state["pos"] < len(pcm) \
+                            and not stream.active:
+                        if attempt == 0:
+                            self._log("piper: stream ended early "
+                                      "(pos "
+                                      f"{state['pos']}/{len(pcm)}) "
+                                      "→ restarting once")
+                            continue
+                        self._log("piper: early end again")
+                        return False
+                finally:
+                    try:
+                        stream.abort()
+                        stream.close()
+                    except Exception:
+                        pass
+                    with self._lock:
+                        self._cur_engine = None
+            return False
         except Exception as e:
+            self._log(f"piper failed: {e.__class__.__name__}: {e}")
             if not self._stopped.is_set():
                 self._emit({"type": "_tts_status", "ok": False,
                             "msg": (f"neural voice skipped: "
